@@ -20,9 +20,11 @@
     left: -9999px;
   }
   canvas {
-    display: block;
+    position: fixed;
+    inset: 0;
     width: 100vw;
     height: 100vh;
+    object-fit: cover;
     transform: scaleX(-1);
   }
   #error {
@@ -36,41 +38,329 @@
     color: #e6e6e6;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 0.95rem;
+    white-space: pre-wrap;
   }
 </style>
 </head>
 <body>
   <video id="video" autoplay playsinline muted></video>
-  <canvas id="canvas"></canvas>
+  <canvas id="overlay"></canvas>
   <div id="error"></div>
 
-  <script>
+  <script type="module">
+    import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
     const video = document.getElementById('video');
-    const canvas = document.getElementById('canvas');
+    const canvas = document.getElementById('overlay');
     const ctx = canvas.getContext('2d');
     const errorEl = document.getElementById('error');
 
-    function resizeCanvas() {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+    const THUMB_TIP = 4;
+    const INDEX_TIP = 8;
+    const STITCH = 4; // cross-stitch cell size in pixels
+    const LEVELS = 5;  // brightness quantization levels for the heatmap
+    const BAYER = [
+      [0, 8, 2, 10],
+      [12, 4, 14, 6],
+      [3, 11, 1, 9],
+      [15, 7, 13, 5]
+    ];
+
+    const temp = document.createElement('canvas');
+    const tempCtx = temp.getContext('2d', { willReadFrequently: true });
+
+    function heatColor(t) {
+      const r = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 3))) * 255;
+      const g = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 2))) * 255;
+      const b = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 1))) * 255;
+      return [r, g, b];
     }
-    window.addEventListener('resize', resizeCanvas);
-    resizeCanvas();
 
-    const STEP = 6; // pixels of new footage drawn per frame
+    function applyHeatmapStitch(minX, minY, boxW, boxH) {
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, boxW, boxH);
+      const sample = tempCtx.getImageData(0, 0, boxW, boxH).data;
+      const step = 1 / (LEVELS - 1);
 
-    function renderSlitScan() {
-      // scroll existing image left by STEP pixels
-      ctx.drawImage(canvas, -STEP, 0);
-      // draw a fresh STEP-pixel-wide slice of the current camera frame on the right edge,
-      // so each x position across the screen is a different moment in time
-      const sx = video.videoWidth / 2 - STEP / 2;
-      ctx.drawImage(
-        video,
-        sx, 0, STEP, video.videoHeight,
-        canvas.width - STEP, 0, STEP, canvas.height
+      for (let cy = 0, row = 0; cy < boxH; cy += STITCH, row++) {
+        for (let cx = 0, col = 0; cx < boxW; cx += STITCH, col++) {
+          const px = Math.min(boxW - 1, cx + (STITCH >> 1));
+          const py = Math.min(boxH - 1, cy + (STITCH >> 1));
+          const idx = (py * boxW + px) * 4;
+          const bayer = BAYER[row % 4][col % 4] / 16 - 0.5;
+
+          const r0 = sample[idx], g0 = sample[idx + 1], b0 = sample[idx + 2];
+          const lum = (r0 * 0.299 + g0 * 0.587 + b0 * 0.114) / 255;
+
+          let t = lum + bayer * step;
+          t = Math.max(0, Math.min(1, Math.round(t / step) * step));
+          const [qr, qg, qb] = heatColor(t);
+
+          const cellW = Math.min(STITCH, boxW - cx);
+          const cellH = Math.min(STITCH, boxH - cy);
+          const dx = minX + cx;
+          const dy = minY + cy;
+
+          ctx.fillStyle = `rgb(${qr},${qg},${qb})`;
+          ctx.fillRect(dx, dy, cellW, cellH);
+
+          const luminance = qr * 0.299 + qg * 0.587 + qb * 0.114;
+          ctx.strokeStyle = luminance > 128 ? 'rgba(0,0,0,0.35)' : 'rgba(255,255,255,0.45)';
+          ctx.lineWidth = 1.25;
+          ctx.beginPath();
+          ctx.moveTo(dx, dy);
+          ctx.lineTo(dx + cellW, dy + cellH);
+          ctx.moveTo(dx + cellW, dy);
+          ctx.lineTo(dx, dy + cellH);
+          ctx.stroke();
+        }
+      }
+    }
+
+    function applyMosaic(minX, minY, boxW, boxH) {
+      const BLOCK = 16;
+      const smallW = Math.max(1, Math.round(boxW / BLOCK));
+      const smallH = Math.max(1, Math.round(boxH / BLOCK));
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, smallW, smallH);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(temp, 0, 0, smallW, smallH, minX, minY, boxW, boxH);
+      ctx.imageSmoothingEnabled = true;
+    }
+
+    function applyLiquidGlass(minX, minY, boxW, boxH, t) {
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, boxW, boxH);
+      const cellsX = Math.min(16, Math.max(4, Math.round(boxW / 22)));
+      const cellsY = Math.min(16, Math.max(4, Math.round(boxH / 22)));
+      const cellW = boxW / cellsX;
+      const cellH = boxH / cellsY;
+      const amp = Math.min(boxW, boxH) * 0.07;
+
+      for (let i = 0; i < cellsX; i++) {
+        for (let j = 0; j < cellsY; j++) {
+          const sx0 = i * cellW;
+          const sy0 = j * cellH;
+          const dx0 = Math.sin(t * 1.6 + i * 0.9 + j * 0.5) * amp;
+          const dy0 = Math.cos(t * 1.3 + j * 0.9 + i * 0.4) * amp;
+          const sx = Math.max(0, Math.min(boxW - cellW, sx0 + dx0));
+          const sy = Math.max(0, Math.min(boxH - cellH, sy0 + dy0));
+          ctx.drawImage(
+            temp,
+            sx, sy, cellW + 1, cellH + 1,
+            minX + sx0, minY + sy0, cellW + 1, cellH + 1
+          );
+        }
+      }
+    }
+
+    function applyInvert(minX, minY, boxW, boxH) {
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, boxW, boxH);
+      const imgData = tempCtx.getImageData(0, 0, boxW, boxH);
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = 255 - d[i];
+        d[i + 1] = 255 - d[i + 1];
+        d[i + 2] = 255 - d[i + 2];
+      }
+      tempCtx.putImageData(imgData, 0, 0);
+      ctx.drawImage(temp, 0, 0, boxW, boxH, minX, minY, boxW, boxH);
+    }
+
+    function applyPosterize(minX, minY, boxW, boxH) {
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, boxW, boxH);
+      const imgData = tempCtx.getImageData(0, 0, boxW, boxH);
+      const d = imgData.data;
+      const levels = 4;
+      const step = 255 / (levels - 1);
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = Math.round(d[i] / step) * step;
+        d[i + 1] = Math.round(d[i + 1] / step) * step;
+        d[i + 2] = Math.round(d[i + 2] / step) * step;
+      }
+      tempCtx.putImageData(imgData, 0, 0);
+      ctx.drawImage(temp, 0, 0, boxW, boxH, minX, minY, boxW, boxH);
+    }
+
+    function applyEdges(minX, minY, boxW, boxH) {
+      tempCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, boxW, boxH);
+      const w = boxW, h = boxH;
+      const src = tempCtx.getImageData(0, 0, w, h).data;
+      const gray = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) {
+        gray[i] = src[i * 4] * 0.299 + src[i * 4 + 1] * 0.587 + src[i * 4 + 2] * 0.114;
+      }
+      const out = new Uint8ClampedArray(src.length);
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const idx = y * w + x;
+          const gx = gray[idx - w - 1] + 2 * gray[idx - 1] + gray[idx + w - 1]
+                   - (gray[idx - w + 1] + 2 * gray[idx + 1] + gray[idx + w + 1]);
+          const gy = gray[idx - w - 1] + 2 * gray[idx - w] + gray[idx - w + 1]
+                   - (gray[idx + w - 1] + 2 * gray[idx + w] + gray[idx + w + 1]);
+          const mag = Math.min(255, Math.sqrt(gx * gx + gy * gy));
+          const o = idx * 4;
+          out[o] = out[o + 1] = out[o + 2] = mag;
+          out[o + 3] = 255;
+        }
+      }
+      tempCtx.putImageData(new ImageData(out, w, h), 0, 0);
+      ctx.drawImage(temp, 0, 0, w, h, minX, minY, w, h);
+    }
+
+    function applyScanlines(minX, minY, boxW, boxH, t) {
+      ctx.drawImage(video, minX, minY, boxW, boxH, minX, minY, boxW, boxH);
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      for (let y = minY; y < minY + boxH; y += 4) {
+        const offset = (Math.floor(t * 40) + y) % 8;
+        if (offset < 2) ctx.fillRect(minX, y, boxW, 1);
+      }
+      const sweepY = minY + ((t * 60) % boxH);
+      const grad = ctx.createLinearGradient(minX, sweepY - 10, minX, sweepY + 10);
+      grad.addColorStop(0, 'rgba(255,255,255,0)');
+      grad.addColorStop(0.5, 'rgba(255,255,255,0.5)');
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(minX, minY, boxW, boxH);
+    }
+
+    function applyRainbow(minX, minY, boxW, boxH, t) {
+      ctx.filter = `saturate(3) hue-rotate(${(t * 120) % 360}deg)`;
+      ctx.drawImage(video, minX, minY, boxW, boxH, minX, minY, boxW, boxH);
+      ctx.filter = 'none';
+    }
+
+    let handLandmarker = null;
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.style.display = 'flex';
+    }
+
+    window.addEventListener('error', (e) => console.error('Uncaught error:', e.error || e.message));
+    window.addEventListener('unhandledrejection', (e) => console.error('Unhandled rejection:', e.reason));
+
+    function renderLoop() {
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const grayData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const gd = grayData.data;
+        for (let i = 0; i < gd.length; i += 4) {
+          const gray = gd[i] * 0.299 + gd[i + 1] * 0.587 + gd[i + 2] * 0.114;
+          gd[i] = gd[i + 1] = gd[i + 2] = gray;
+        }
+        ctx.putImageData(grayData, 0, 0);
+
+        if (handLandmarker && video.readyState >= 2) {
+          try {
+            const result = handLandmarker.detectForVideo(video, performance.now());
+            const hands = result.landmarks || [];
+            const t = performance.now() / 1000;
+
+            if (hands.length === 2) {
+              const quadPoints = [];
+              for (const landmarks of hands) {
+                const thumb = landmarks[THUMB_TIP];
+                const index = landmarks[INDEX_TIP];
+                quadPoints.push(
+                  { x: thumb.x * canvas.width, y: thumb.y * canvas.height },
+                  { x: index.x * canvas.width, y: index.y * canvas.height }
+                );
+              }
+
+              const cx = quadPoints.reduce((s, p) => s + p.x, 0) / 4;
+              const cy = quadPoints.reduce((s, p) => s + p.y, 0) / 4;
+              quadPoints.sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+
+              const buildPath = () => {
+                ctx.beginPath();
+                ctx.moveTo(quadPoints[0].x, quadPoints[0].y);
+                for (let i = 1; i < quadPoints.length; i++) {
+                  ctx.lineTo(quadPoints[i].x, quadPoints[i].y);
+                }
+                ctx.closePath();
+              };
+
+              const minX = Math.max(0, Math.min(...quadPoints.map(p => p.x)));
+              const minY = Math.max(0, Math.min(...quadPoints.map(p => p.y)));
+              const maxX = Math.min(canvas.width, Math.max(...quadPoints.map(p => p.x)));
+              const maxY = Math.min(canvas.height, Math.max(...quadPoints.map(p => p.y)));
+              const boxW = Math.round(maxX - minX);
+              const boxH = Math.round(maxY - minY);
+
+              if (boxW > 0 && boxH > 0) {
+                temp.width = boxW;
+                temp.height = boxH;
+
+                // shoelace formula for the quad's true area
+                let shoelace = 0;
+                for (let i = 0; i < quadPoints.length; i++) {
+                  const a = quadPoints[i];
+                  const b = quadPoints[(i + 1) % quadPoints.length];
+                  shoelace += a.x * b.y - b.x * a.y;
+                }
+                const area = Math.abs(shoelace) / 2;
+                const areaFraction = area / (canvas.width * canvas.height);
+
+                let effect;
+                if (areaFraction < 0.02) effect = 'invert';
+                else if (areaFraction < 0.05) effect = 'mosaic';
+                else if (areaFraction < 0.09) effect = 'posterize';
+                else if (areaFraction < 0.13) effect = 'heatmap';
+                else if (areaFraction < 0.18) effect = 'edges';
+                else if (areaFraction < 0.24) effect = 'scanlines';
+                else if (areaFraction < 0.30) effect = 'liquid';
+                else effect = 'rainbow';
+
+                ctx.save();
+                buildPath();
+                ctx.clip();
+
+                if (effect === 'heatmap') applyHeatmapStitch(minX, minY, boxW, boxH);
+                else if (effect === 'mosaic') applyMosaic(minX, minY, boxW, boxH);
+                else if (effect === 'liquid') applyLiquidGlass(minX, minY, boxW, boxH, t);
+                else if (effect === 'invert') applyInvert(minX, minY, boxW, boxH);
+                else if (effect === 'posterize') applyPosterize(minX, minY, boxW, boxH);
+                else if (effect === 'edges') applyEdges(minX, minY, boxW, boxH);
+                else if (effect === 'scanlines') applyScanlines(minX, minY, boxW, boxH, t);
+                else if (effect === 'rainbow') applyRainbow(minX, minY, boxW, boxH, t);
+
+                ctx.restore();
+              }
+
+              buildPath();
+              ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+              ctx.lineWidth = 2;
+              ctx.stroke();
+            }
+          } catch (err) {
+            console.error('Hand detection error:', err);
+          }
+        }
+      } catch (err) {
+        console.error('Render loop error:', err);
+      } finally {
+        requestAnimationFrame(renderLoop);
+      }
+    }
+
+    async function setupHandTracking() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
       );
-      requestAnimationFrame(renderSlitScan);
+      const modelAssetPath = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+      try {
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath, delegate: 'GPU' },
+          runningMode: 'VIDEO',
+          numHands: 2
+        });
+      } catch (err) {
+        console.error('GPU delegate failed, falling back to CPU:', err);
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath, delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          numHands: 2
+        });
+      }
     }
 
     async function startCamera() {
@@ -81,15 +371,17 @@
         });
         video.srcObject = stream;
         video.addEventListener('loadedmetadata', () => {
-          renderSlitScan();
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          renderLoop();
         }, { once: true });
       } catch (err) {
-        errorEl.textContent = 'Could not access camera: ' + err.message;
-        errorEl.style.display = 'flex';
+        showError('Could not access camera: ' + err.message);
       }
     }
 
     startCamera();
+    setupHandTracking().catch((err) => console.error('Hand tracking failed to load:', err));
   </script>
 </body>
 </html>
