@@ -57,16 +57,18 @@
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
 
+    const STEP = 6; // pixels of new footage drawn per frame
+
     function renderSlitScan() {
-      // scroll existing image one pixel to the left
-      ctx.drawImage(canvas, -1, 0);
-      // draw a fresh one-pixel-wide slice of the current camera frame on the right edge,
+      // scroll existing image left by STEP pixels
+      ctx.drawImage(canvas, -STEP, 0);
+      // draw a fresh STEP-pixel-wide slice of the current camera frame on the right edge,
       // so each x position across the screen is a different moment in time
-      const sx = video.videoWidth / 2;
+      const sx = video.videoWidth / 2 - STEP / 2;
       ctx.drawImage(
         video,
-        sx, 0, 1, video.videoHeight,
-        canvas.width - 1, 0, 1, canvas.height
+        sx, 0, STEP, video.videoHeight,
+        canvas.width - STEP, 0, STEP, canvas.height
       );
       requestAnimationFrame(renderSlitScan);
     }
